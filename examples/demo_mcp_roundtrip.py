@@ -75,6 +75,10 @@ async def main() -> None:
         print("Demo complete: server + client round-trip over MCP streamable HTTP.")
     finally:
         serve_task.cancel()
+        try:
+            await serve_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
