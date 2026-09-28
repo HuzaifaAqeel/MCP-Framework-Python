@@ -1,0 +1,1289 @@
+# Copyright (c) 2026 Dedalus Labs, Inc. and its contributors
+# SPDX-License-Identifier: MIT
+
+"""A composable MCP server."""
+
+from __future__ import annotations
+
+import base64
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from dataclasses import dataclass
+from functools import wraps
+import inspect
+import time
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Literal
+
+import anyio
+
+from .transports.base import BaseTransport, TransportFactory
+
+
+try:
+    import uvloop
+
+    uvloop.install()
+    _USING_UVLOOP = True
+except ImportError:
+    _USING_UVLOOP = False
+
+from mcp.server.lowlevel.helper_types import ReadResourceContents
+from mcp.server.lowlevel.server import NotificationOptions, Server, request_ctx
+from mcp.server.lowlevel.server import lifespan as default_lifespan
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.context import RequestContext
+from mcp.shared.exceptions import McpError
+from mcp.shared.message import ServerMessageMetadata
+from mcp.shared.session import RequestResponder
+
+from .authorization import AuthorizationConfig, AuthorizationManager, AuthorizationProvider
+from .config import ServerConfig
+from .notifications import DefaultNotificationSink, NotificationSink
+from .services import (
+    CompletionService,
+    ElicitationService,
+    LoggingService,
+    PingService,
+    PromptsService,
+    ResourcesService,
+    RootsService,
+    SamplingService,
+    ToolsService,
+)
+from .services.protocols import (
+    CompletionServiceProtocol,
+    ElicitationServiceProtocol,
+    LoggingServiceProtocol,
+    PingServiceProtocol,
+    PromptsServiceProtocol,
+    ResourcesServiceProtocol,
+    RootsServiceProtocol,
+    SamplingServiceProtocol,
+    ToolsServiceProtocol,
+)
+from .subscriptions import SubscriptionManager
+from .transports import ASGIRunConfig, StdioTransport, StreamableHTTPTransport
+from ..completion import CompletionSpec, extract_completion_spec
+from ..completion import reset_active_server as reset_completion_server
+from ..completion import set_active_server as set_completion_server
+from ..context import RUNTIME_CONTEXT_KEY
+from ..prompt import PromptSpec, extract_prompt_spec
+from ..prompt import reset_active_server as reset_prompt_server
+from ..prompt import set_active_server as set_prompt_server
+from ..resource import ResourceSpec, extract_resource_spec
+from ..resource import reset_active_server as reset_resource_server
+from ..resource import set_active_server as set_resource_server
+from ..resource_template import ResourceTemplateSpec, extract_resource_template_spec
+from ..resource_template import reset_active_server as reset_resource_template_server
+from ..resource_template import set_active_server as set_resource_template_server
+from ..tool import ToolSpec, extract_tool_spec
+from ..tool import reset_active_server as reset_tool_server
+from ..tool import set_active_server as set_tool_server
+from ..types.client.elicitation import ElicitRequestParams, ElicitResult
+from ..types.client.roots import ListRootsRequest, ListRootsResult, RootsListChangedNotification
+from ..types.client.sampling import CreateMessageRequestParams, CreateMessageResult
+from ..types.lifecycle import InitializedNotification
+from ..types.messages import ClientNotification, ClientRequest, ServerRequest, ServerResult
+from ..types.server.completions import Completion, CompletionArgument, CompletionContext, ResourceTemplateReference
+from ..types.server.prompts import GetPromptResult, ListPromptsRequest, ListPromptsResult, PromptReference
+from ..types.server.resources import (
+    ListResourcesRequest,
+    ListResourcesResult,
+    ListResourceTemplatesRequest,
+    ListResourceTemplatesResult,
+)
+from ..types.server.tools import ListToolsRequest, ListToolsResult
+from ..types.shared.base import INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND, ErrorData, RequestParams
+from ..types.shared.capabilities import Icon, ServerCapabilities
+from ..types.shared.content import BlobResourceContents, ContentBlock, TextContent, TextResourceContents
+from ..types.shared.primitives import LoggingLevel
+from ..utils import get_logger
+
+
+if TYPE_CHECKING:
+    from anyio.abc import TaskGroup
+    from mcp.server.models import InitializationOptions
+    from mcp.server.session import ServerSession
+
+    from .connectors import Connection
+    from .resolver import ConnectionResolver
+
+TransportLiteral = Literal["stdio", "streamable-http"]
+
+
+@dataclass(slots=True)
+class NotificationFlags:
+    """Notifications advertised during initialization."""
+
+    prompts_changed: bool = False
+    resources_changed: bool = False
+    tools_changed: bool = False
+    roots_changed: bool = False
+
+
+class ServerValidationError(RuntimeError):
+    """Raised when the server configuration violates MCP requirements."""
+
+
+# TODO: Temporary patch until we get proper versioning logic (that pervades the docs too).
+_SPEC_URLS = {
+    "tools": "https://modelcontextprotocol.io/specification/2025-06-18/server/tools",
+    "resources": "https://modelcontextprotocol.io/specification/2025-06-18/server/resources",
+    "prompts": "https://modelcontextprotocol.io/specification/2025-06-18/server/prompts",
+    "roots": "https://modelcontextprotocol.io/specification/2025-06-18/client/roots",
+    "sampling": "https://modelcontextprotocol.io/specification/2025-06-18/client/sampling",
+    "elicitation": "https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation",
+    "completions": "https://modelcontextprotocol.io/specification/2025-06-18/server/completions",
+    "logging": "https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/logging",
+    "ping": "https://modelcontextprotocol.io/specification/2025-06-18/basic/utilities/ping",
+}
+
+
+class MCPServer(Server[Any, Any]):
+    """Spec-aligned server surface for MCP applications.
+
+    Basic usage with decorators:
+
+        >>> from dedalus_mcp import MCPServer, tool
+        >>>
+        >>> server = MCPServer("calculator")
+        >>>
+        >>> @tool(description="Add two numbers")
+        ... def add(a: int, b: int) -> int:
+        ...     return a + b
+        >>>
+        >>> server.collect(add)
+
+    With configuration:
+
+        >>> from dedalus_mcp.server import ServerConfig, SamplingConfig
+        >>>
+        >>> config = ServerConfig(
+        ...     sampling=SamplingConfig(timeout=30.0), pagination_limit=100),
+        ... )
+        >>> server = MCPServer("my-server", config=config)
+
+    With authorization:
+
+        >>> from dedalus_mcp.server.auth import AuthorizationConfig
+        >>>
+        >>> server = MCPServer(
+        ...     "protected-server", authorization=AuthorizationConfig(enabled=True)
+        ... )
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        # Bundled config for power users
+        config: ServerConfig | None = None,
+        # Common params stay explicit for discoverability
+        version: str | None = None,
+        instructions: str | None = None,
+        website_url: str | None = None,
+        icons: list[Icon] | None = None,
+        notification_flags: NotificationFlags | None = None,
+        experimental_capabilities: Mapping[str, Mapping[str, Any]] | None = None,
+        lifespan: Callable[[Server[Any, Any]], Any] = default_lifespan,
+        transport: str | None = None,
+        notification_sink: NotificationSink | None = None,
+        http_security: TransportSecuritySettings | None = None,
+        authorization: AuthorizationConfig | None = None,
+        authorization_server: str = "https://as.dedaluslabs.ai",
+        streamable_http_stateless: bool = True,  # TODO: Defaulting to True for now, but look into this.
+        allow_dynamic_tools: bool = False,
+        resource_uri: str | None = None,
+        connector_kind: str | None = None,
+        connector_params: dict[str, type] | None = None,
+        auth_methods: list[str] | None = None,
+        connections: list[Connection] | None = None,
+    ) -> None:
+        # Resolve config with param overrides taking precedence
+        cfg = config or ServerConfig()
+
+        # Config values can be overridden by explicit params
+        resolved_icons = icons if icons is not None else cfg.icons
+        resolved_notification_sink = notification_sink if notification_sink is not None else cfg.notification_sink
+        pagination_limit = cfg.pagination_limit
+
+        self._notification_flags = notification_flags or NotificationFlags()
+        self._experimental_capabilities = {key: dict(value) for key, value in (experimental_capabilities or {}).items()}
+        self._base_lifespan = lifespan
+        self._connection_resolver: ConnectionResolver | None = None
+
+        # Build connections map with validation
+        self._connections: dict[str, Connection] = {}
+        if connections:
+            # Multi-connection servers require all connections to have non-empty names
+            if len(connections) > 1:
+                unnamed = [c for c in connections if not c.name]
+                if unnamed:
+                    msg = (
+                        "Multi-connection servers require all connections to have names. "
+                        f"Found {len(unnamed)} connection(s) without names."
+                    )
+                    raise ValueError(msg)
+
+            for conn in connections:
+                if conn.name in self._connections:
+                    msg = f"Duplicate connection name: {conn.name!r}"
+                    raise ValueError(msg)
+                self._connections[conn.name] = conn
+
+        # Dispatch backend (initialized in _build_runtime_payload)
+        self._dispatch_backend: Any = None
+        super().__init__(
+            name,
+            version=version,
+            instructions=instructions,
+            website_url=website_url,
+            icons=resolved_icons,
+            lifespan=lifespan,
+        )
+        self.lifespan = self._wrap_lifespan(self._base_lifespan)
+        self._default_transport = transport.lower() if transport else "streamable-http"
+        self._logger = get_logger(f"dedalus_mcp.server.{name}")
+
+        # Log event loop implementation
+        loop_impl = "uvloop" if _USING_UVLOOP else "asyncio"
+        self._logger.debug("Event loop: %s", loop_impl)
+
+        self._notification_sink: NotificationSink = resolved_notification_sink or DefaultNotificationSink()
+
+        self._subscription_manager: SubscriptionManager = SubscriptionManager()
+        self.resources: ResourcesService = ResourcesService(
+            subscription_manager=self._subscription_manager,
+            logger=self._logger,
+            pagination_limit=pagination_limit,
+            notification_sink=self._notification_sink,
+        )
+        self.roots: RootsService = RootsService(self._call_roots_list)
+        self.tools: ToolsService = ToolsService(
+            server_ref=self,
+            attach_callable=self._attach_tool,
+            detach_callable=self._detach_tool,
+            logger=self._logger,
+            pagination_limit=pagination_limit,
+            notification_sink=self._notification_sink,
+        )
+        self.prompts: PromptsService = PromptsService(
+            logger=self._logger, pagination_limit=pagination_limit, notification_sink=self._notification_sink
+        )
+        self.completions: CompletionService = CompletionService(limit=cfg.completion_limit)
+        self.logging_service: LoggingService = LoggingService(self._logger, notification_sink=self._notification_sink)
+        self.sampling: SamplingService = SamplingService(
+            timeout=cfg.sampling.timeout,
+            max_concurrent=cfg.sampling.max_concurrent,
+            failure_threshold=cfg.sampling.failure_threshold,
+            cooldown_seconds=cfg.sampling.cooldown_seconds,
+        )
+        self.elicitation: ElicitationService = ElicitationService(timeout=cfg.elicitation.timeout)
+        self.ping: PingService = PingService(
+            notification_sink=self._notification_sink, logger=self._logger, default_phi=cfg.ping.phi_threshold
+        )
+
+        self._http_security_settings = (
+            http_security if http_security is not None else self._default_http_security_settings()
+        )
+
+        self._streamable_http_stateless = streamable_http_stateless
+        self._allow_dynamic_tools = allow_dynamic_tools
+        self._runtime_started = False
+        self._tool_mutation_pending_notification = False
+        self._binding_depth = 0
+        self._active_transport: BaseTransport | None = None
+        self._serving_url: str | None = None
+
+        self._resource_uri = resource_uri
+        self._connector_kind = connector_kind
+        self._connector_params = connector_params
+        self._auth_methods = auth_methods
+
+        # Auto-enable authorization when connections are defined (they require JWT claims)
+        if authorization is not None:
+            auth_config = authorization
+            auto_configure_jwt = False
+        elif connections:
+            # Connections require auth to resolve name → handle from JWT.
+            # Pass authorization_server to AuthorizationConfig so it appears in
+            # the /.well-known/oauth-protected-resource metadata (RFC 9728).
+            auth_config = AuthorizationConfig(enabled=True, authorization_servers=[authorization_server])
+            auto_configure_jwt = True
+        else:
+            auth_config = AuthorizationConfig()
+            auto_configure_jwt = False
+
+        self._authorization_manager: AuthorizationManager | None = None
+        if auth_config.enabled:
+            self._authorization_manager = AuthorizationManager(auth_config)
+            # Auto-configure JWT validator when connections trigger auto-enable.
+            #
+            # TODO(RFC 9728): Support multi-issuer JWT validation. Per RFC 9728,
+            # authorization_servers is a list because a resource MAY trust tokens
+            # from multiple AS's. Currently we only validate against one issuer.
+            # For enterprise multi-IdP scenarios, we'd need to try validation
+            # against each configured AS until one succeeds.
+            if auto_configure_jwt:
+                from .services.jwt_validator import JWTValidator, JWTValidatorConfig
+
+                as_url = authorization_server.rstrip("/")
+                jwt_config = JWTValidatorConfig(jwks_uri=f"{as_url}/.well-known/jwks.json", issuer=as_url)
+                self._authorization_manager.set_provider(JWTValidator(jwt_config))
+
+        self._transport_factories: dict[str, TransportFactory] = {}
+        self.register_transport("stdio", lambda server: StdioTransport(server))
+        stream_http_factory = lambda server: StreamableHTTPTransport(
+            server, security_settings=self._http_security_settings, stateless=self._streamable_http_stateless
+        )
+        self.register_transport("streamable-http", stream_http_factory, aliases=("streamable_http", "shttp", "http"))
+
+        self.notification_handlers[InitializedNotification] = self._handle_initialized
+        self.notification_handlers[RootsListChangedNotification] = self._handle_roots_list_changed
+
+        # //////////////////////////////////////////////////////////////////
+        # Register default handlers
+        # //////////////////////////////////////////////////////////////////
+
+        @self.list_resources()
+        async def _list_resources(request: ListResourcesRequest) -> ListResourcesResult:
+            result: ListResourcesResult = await self.resources.list_resources(request)
+            return result
+
+        @self.read_resource()
+        async def _read_resource(uri: str) -> list[ReadResourceContents]:
+            result = await self.resources.read(str(uri))
+            converted: list[ReadResourceContents] = []
+            for item in result.contents:
+                if isinstance(item, TextResourceContents):
+                    converted.append(ReadResourceContents(content=item.text, mime_type=item.mimeType))
+                elif isinstance(item, BlobResourceContents):
+                    data = base64.b64decode(item.blob)
+                    converted.append(ReadResourceContents(content=data, mime_type=item.mimeType))
+                else:
+                    msg = f"Unsupported resource content type: {type(item)!r}"
+                    raise TypeError(msg)
+            return converted
+
+        @self.list_resource_templates()
+        async def _list_templates(request: ListResourceTemplatesRequest) -> ListResourceTemplatesResult:
+            cursor = request.params.cursor if request.params is not None else None
+            result: ListResourceTemplatesResult = await self.resources.list_templates(cursor)
+            return result
+
+        @self.list_tools()
+        async def _list_tools(request: ListToolsRequest) -> ListToolsResult:
+            result: ListToolsResult = await self.tools.list_tools(request)
+            return result
+
+        @self.call_tool(validate_input=False)
+        async def _call_tool(
+            name: str, arguments: dict[str, Any] | None
+        ) -> tuple[list[ContentBlock], dict[str, Any] | None]:
+            result = await self.tools.call_tool(name, arguments or {})
+            if result.isError:
+                message = "Tool execution failed"
+                if result.content:
+                    first = result.content[0]
+                    if isinstance(first, TextContent) and first.text:
+                        message = first.text
+                raise McpError(ErrorData(code=INTERNAL_ERROR, message=message))
+
+            structured = result.structuredContent if result.structuredContent is not None else None
+            return list(result.content), structured
+
+        @self.completion()
+        async def _completion_handler(
+            ref: PromptReference | ResourceTemplateReference,
+            argument: CompletionArgument,
+            context: CompletionContext | None,
+        ) -> Completion | None:
+            return await self.completions.execute(ref, argument, context)
+
+        @self.subscribe_resource()
+        async def _subscribe(uri: Any) -> None:
+            await self.resources.subscribe_current(str(uri))
+
+        @self.unsubscribe_resource()
+        async def _unsubscribe(uri: Any) -> None:
+            await self.resources.unsubscribe_current(str(uri))
+
+        @self.list_prompts()
+        async def _list_prompts(request: ListPromptsRequest) -> ListPromptsResult:
+            result: ListPromptsResult = await self.prompts.list_prompts(request)
+            return result
+
+        @self.get_prompt()
+        async def _get_prompt(name: str, arguments: dict[str, str] | None) -> GetPromptResult:
+            result: GetPromptResult = await self.prompts.get_prompt(name, arguments)
+            return result
+
+        @self.set_logging_level()
+        async def _set_logging_level(level: LoggingLevel) -> None:
+            await self.logging_service.set_level(level)
+
+    # //////////////////////////////////////////////////////////////////
+    # Public API mirroring earlier behavior
+    # //////////////////////////////////////////////////////////////////
+
+    @property
+    def tool_names(self) -> list[str]:
+        return self.tools.tool_names
+
+    @property
+    def prompt_names(self) -> list[str]:
+        return self.prompts.names
+
+    @property
+    def resource_uri(self) -> str | None:
+        return self._resource_uri
+
+    @property
+    def connector_kind(self) -> str | None:
+        return self._connector_kind
+
+    @property
+    def connector_params(self) -> dict[str, type] | None:
+        return self._connector_params
+
+    @property
+    def auth_methods(self) -> list[str] | None:
+        return self._auth_methods
+
+    @property
+    def connections(self) -> dict[str, Connection]:
+        """Connection definitions declared by this server."""
+        return self._connections
+
+    @property
+    def url(self) -> str | None:
+        """URL where this server is serving, or None if not started.
+
+        This property returns the base URL of the MCP endpoint when the server
+        is running via HTTP transport. Returns None if the server hasn't been
+        started or is using a non-HTTP transport (e.g., stdio).
+
+        The URL is set when `serve()` or `serve_streamable_http()` is called
+        and cleared when the server stops.
+
+        Example:
+            >>> server = MCPServer("calculator")
+            >>> server.collect(add)
+            >>> print(server.url)  # None - not yet started
+            >>> asyncio.create_task(server.serve(port=8000))
+            >>> await asyncio.sleep(0.5)  # Wait for startup
+            >>> print(server.url)  # "http://127.0.0.1:8000/mcp"
+        """
+        return self._serving_url
+
+    def get_mcp_metadata(self) -> dict[str, Any]:
+        """Return MCP connection metadata for .well-known/mcp-server.json.
+
+        Provides discovery information including connection schema, available tools,
+        and required authentication scopes according to the MCP connection schema
+        specification.
+        """
+        metadata: dict[str, Any] = {"mcp_server_version": "2025-06-18"}
+
+        if self._resource_uri:
+            metadata["resource_uri"] = self._resource_uri
+
+        if self._connector_kind or self._connector_params or self._auth_methods:
+            connector_schema: dict[str, Any] = {"version": "1"}
+
+            if self._connector_kind:
+                connector_schema["resource_kind"] = self._connector_kind
+
+            if self._connector_params:
+                params = {name: typ.__name__ for name, typ in self._connector_params.items()}
+                connector_schema["params"] = params
+
+            if self._auth_methods:
+                connector_schema["auth_supported"] = list(self._auth_methods)
+
+            metadata["connector_schema"] = connector_schema
+
+        tool_names = self.tools.tool_names
+        if tool_names:
+            metadata["tools"] = tool_names
+
+        if self._authorization_manager:
+            required_scopes = self._authorization_manager.get_required_scopes()
+            if required_scopes:
+                metadata["required_scopes"] = required_scopes
+
+        return metadata
+
+    def active_sessions(self) -> tuple[ServerSession, ...]:
+        """Return a snapshot of currently tracked client sessions."""
+        return self.ping.active()
+
+    async def ping_client(self, session: ServerSession, *, timeout: float | None = None) -> bool:
+        """Send ``ping`` to a specific client session.
+
+        See: https://modelcontextprotocol.io/specification/2025-06-18/basic/utilities/ping
+        """
+        return await self.ping.ping(session, timeout=timeout)
+
+    async def ping_clients(
+        self,
+        sessions: Iterable[ServerSession] | None = None,
+        *,
+        timeout: float | None = None,
+        max_concurrency: int | None = None,
+    ) -> dict[ServerSession, bool]:
+        """Ping a set of client sessions, defaulting to all active connections."""
+        return await self.ping.ping_many(sessions, timeout=timeout, max_concurrency=max_concurrency)
+
+    async def ping_current_session(self, *, timeout: float | None = None) -> bool:
+        """Convenience wrapper that pings the client associated with the active request."""
+        try:
+            context = request_ctx.get()
+        except LookupError as exc:
+            msg = "ping_current_session requires an active request context"
+            raise RuntimeError(msg) from exc
+
+        return await self.ping_client(context.session, timeout=timeout)
+
+    async def _handle_message(
+        self, message: Any, session: Any, lifespan_context: Any, raise_exceptions: bool = False
+    ) -> None:
+        if isinstance(message, (RequestResponder, ClientNotification)):
+            self.ping.register(session)
+            self.ping.touch(session)
+        await super()._handle_message(message, session, lifespan_context, raise_exceptions)
+
+    def start_ping_heartbeat(
+        self,
+        task_group: TaskGroup,
+        *,
+        interval: float = 5.0,
+        jitter: float = 0.2,
+        timeout: float = 2.0,
+        phi_threshold: float | None = None,
+        max_concurrency: int | None = None,
+    ) -> None:
+        """Launch a background heartbeat probe loop for all sessions."""
+        self.ping.start_heartbeat(
+            task_group,
+            interval=interval,
+            jitter=jitter,
+            timeout=timeout,
+            phi_threshold=phi_threshold,
+            max_concurrency=max_concurrency,
+        )
+
+    # //////////////////////////////////////////////////////////////////
+    # Collection API - primary registration interface
+    # //////////////////////////////////////////////////////////////////
+
+    def collect(self, *fns: Callable[..., Any]) -> None:
+        """Register decorated functions with this server.
+
+        Extracts metadata from functions decorated with @tool, @resource,
+        @prompt, @completion, or @resource_template and registers them.
+
+        Usage:
+            @tool(description="Add numbers")
+            def add(a: int, b: int) -> int:
+                return a + b
+
+            server = MCPServer("my-server")
+            server.collect(add)
+
+        Raises:
+            ValueError: If a function lacks Dedalus MCP metadata.
+        """
+        for fn in fns:
+            spec = self._extract_spec(fn)
+            if spec is None:
+                fn_name = getattr(fn, "__name__", repr(fn))
+                msg = (
+                    f"'{fn_name}' has no Dedalus MCP metadata. "
+                    "Decorate with @tool, @resource, @prompt, @completion, or @resource_template."
+                )
+                raise ValueError(msg)
+            self._register_spec(spec)
+
+    def collect_from(self, *modules: ModuleType) -> None:
+        """Register all decorated callables from modules.
+
+        Inspects each module for public callables with Dedalus MCP metadata.
+        Functions without metadata are silently skipped.
+
+        Usage:
+            from tools import math, text
+
+            server = MCPServer("my-server")
+            server.collect_from(math, text)
+        """
+        for module in modules:
+            for name in dir(module):
+                if name.startswith("_"):
+                    continue
+                obj = getattr(module, name)
+                if callable(obj):
+                    spec = self._extract_spec(obj)
+                    if spec is not None:
+                        self._register_spec(spec)
+
+    def _extract_spec(
+        self, fn: Callable[..., Any]
+    ) -> ToolSpec | ResourceSpec | PromptSpec | CompletionSpec | ResourceTemplateSpec | None:
+        """Extract any Dedalus MCP spec from a decorated function."""
+        for extractor in (
+            extract_tool_spec,
+            extract_resource_spec,
+            extract_prompt_spec,
+            extract_completion_spec,
+            extract_resource_template_spec,
+        ):
+            spec = extractor(fn)
+            if spec is not None:
+                return spec
+        return None
+
+    def _register_spec(
+        self, spec: ToolSpec | ResourceSpec | PromptSpec | CompletionSpec | ResourceTemplateSpec
+    ) -> None:
+        """Route a spec to the appropriate registration method."""
+        if isinstance(spec, ToolSpec):
+            self.register_tool(spec)
+        elif isinstance(spec, ResourceSpec):
+            self.register_resource(spec)
+        elif isinstance(spec, PromptSpec):
+            self.register_prompt(spec)
+        elif isinstance(spec, CompletionSpec):
+            self.register_completion(spec)
+        elif isinstance(spec, ResourceTemplateSpec):
+            self.register_resource_template(spec)
+
+    # //////////////////////////////////////////////////////////////////
+    # Individual registration methods
+    # //////////////////////////////////////////////////////////////////
+
+    def register_tool(self, target: ToolSpec | Callable[..., Any]) -> ToolSpec:
+        return self.tools.register(target)
+
+    def allow_tools(self, names: Iterable[str] | None) -> None:
+        self.tools.allow_tools(names)
+
+    def register_resource(self, target: ResourceSpec | Callable[[], str | bytes]) -> ResourceSpec:
+        return self.resources.register_resource(target)
+
+    def register_resource_template(self, target: ResourceTemplateSpec | Callable[..., Any]) -> ResourceTemplateSpec:
+        return self.resources.register_template(target)
+
+    def register_prompt(self, target: PromptSpec | Callable[..., Any]) -> PromptSpec:
+        return self.prompts.register(target)
+
+    def register_completion(self, target: CompletionSpec | Callable[..., Any]) -> CompletionSpec:
+        return self.completions.register(target)
+
+    async def invoke_tool(self, name: str, **arguments: Any):
+        return await self.tools.call_tool(name, arguments)
+
+    async def invoke_resource(self, uri: str):
+        return await self.resources.read(uri)
+
+    async def invoke_prompt(self, name: str, *, arguments: dict[str, str] | None = None) -> GetPromptResult:
+        return await self.prompts.get_prompt(name, arguments)
+
+    async def invoke_completion(
+        self,
+        ref: PromptReference | ResourceTemplateReference,
+        argument: CompletionArgument,
+        context: CompletionContext | None = None,
+    ) -> Completion | None:
+        return await self.completions.execute(ref, argument, context)
+
+    async def request_sampling(self, params: CreateMessageRequestParams) -> CreateMessageResult:
+        """Proxy ``sampling/createMessage`` request to client.
+
+        See: https://modelcontextprotocol.io/specification/2025-06-18/client/sampling
+        """
+        return await self.sampling.create_message(params)
+
+    async def request_elicitation(self, params: ElicitRequestParams) -> ElicitResult:
+        """Proxy ``elicitation/create`` request to client.
+
+        See: https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation
+        """
+        return await self.elicitation.create(params)
+
+    async def list_resource_templates_paginated(self, cursor: str | None = None) -> ListResourceTemplatesResult:
+        return await self.resources.list_templates(cursor)
+
+    async def notify_resource_updated(self, uri: str) -> None:
+        await self.resources.notify_updated(uri)
+
+    async def notify_resources_list_changed(self) -> None:
+        if self._notification_flags.resources_changed:
+            await self.resources.notify_list_changed()
+
+    async def notify_tools_list_changed(self) -> None:
+        if self._tool_mutation_pending_notification:
+            self._tool_mutation_pending_notification = False
+        if self._notification_flags.tools_changed:
+            await self.tools.notify_list_changed()
+        elif self._allow_dynamic_tools:
+            self._logger.warning(
+                "tools/list_changed notification requested but NotificationFlags.tools_changed is disabled; "
+                "clients may not learn about dynamic changes."
+            )
+
+    async def notify_prompts_list_changed(self) -> None:
+        if self._notification_flags.prompts_changed:
+            await self.prompts.notify_list_changed()
+
+    async def log_message(self, level: LoggingLevel, data: Any, *, logger: str | None = None) -> None:
+        await self.logging_service.emit(level, data, logger)
+
+    # //////////////////////////////////////////////////////////////////
+    # Mutation tracking helpers
+    # //////////////////////////////////////////////////////////////////
+
+    def record_tool_mutation(self, *, operation: str) -> None:
+        """Public entry point for capability services to report tool registry changes."""
+        self._record_tool_mutation(operation=operation)
+
+    def _record_tool_mutation(self, *, operation: str) -> None:
+        """Track tool mutations so static servers can block them and dynamic servers can warn."""
+        if self._runtime_started and not self._allow_dynamic_tools:
+            raise RuntimeError(
+                "Tool mutation attempted after server startup. Enable allow_dynamic_tools=True to permit runtime changes."
+            )
+
+        if self._runtime_started and self._allow_dynamic_tools:
+            self._tool_mutation_pending_notification = True
+
+    def require_within_roots(self, *, argument: str = "path") -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Decorator enforcing that a handler argument resolves within allowed roots."""
+
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            if not inspect.iscoroutinefunction(func):
+                raise TypeError("require_within_roots expects an async function")
+
+            @wraps(func)
+            async def wrapper(*args: Any, **kwargs: Any) -> Any:
+                if argument not in kwargs:
+                    raise McpError(
+                        ErrorData(
+                            code=INVALID_PARAMS, message=f"Argument '{argument}' is required for roots validation"
+                        )
+                    )
+
+                try:
+                    context = request_ctx.get()
+                except LookupError as exc:
+                    raise RuntimeError("Roots guard requires an active request context") from exc
+
+                guard = self.roots.guard(context.session)
+                candidate = kwargs[argument]
+                if not guard.within(candidate):
+                    raise McpError(
+                        ErrorData(
+                            code=INVALID_PARAMS, message=f"Path '{candidate}' is outside the client's declared roots"
+                        )
+                    )
+
+                return await func(*args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    async def _call_roots_list(self, session: ServerSession, params: Mapping[str, Any] | None) -> Mapping[str, Any]:
+        list_params: RequestParams | None = None
+        if params is not None:
+            list_params = RequestParams.model_validate(params)
+        request = ListRootsRequest(params=list_params)
+        result = await session.send_request(ServerRequest(request), ListRootsResult)
+        payload: dict[str, Any] = {"roots": [root.model_dump(by_alias=True) for root in result.roots]}
+        next_cursor = getattr(result, "nextCursor", None)
+        if next_cursor is not None:
+            payload["nextCursor"] = next_cursor
+        return payload
+
+    async def _handle_initialized(self, _notification: InitializedNotification) -> None:
+        try:
+            context = request_ctx.get()
+        except LookupError:
+            return
+        self.ping.register(context.session)
+        await self.roots.on_session_open(context.session)
+
+    async def _handle_roots_list_changed(self, _notification: RootsListChangedNotification) -> None:
+        try:
+            context = request_ctx.get()
+        except LookupError:
+            return
+        await self.roots.on_list_changed(context.session)
+
+    # //////////////////////////////////////////////////////////////////
+    # Initialization & capability negotiation
+    # //////////////////////////////////////////////////////////////////
+
+    def create_initialization_options(
+        self,
+        notification_options: NotificationOptions | None = None,
+        experimental_capabilities: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> InitializationOptions:
+        flags = self._notification_flags
+        effective_notifications = notification_options or NotificationOptions(
+            prompts_changed=flags.prompts_changed,
+            resources_changed=flags.resources_changed,
+            tools_changed=flags.tools_changed,
+        )
+        experimental = experimental_capabilities or self._experimental_capabilities
+
+        return super().create_initialization_options(
+            notification_options=effective_notifications,
+            experimental_capabilities={key: dict(value) for key, value in experimental.items()},
+        )
+
+    def get_capabilities(
+        self, notification_options: NotificationOptions, experimental_capabilities: Mapping[str, Mapping[str, Any]]
+    ) -> ServerCapabilities:
+        # Build capabilities from SDK, then apply Dedalus MCP overrides
+        caps = Server.get_capabilities(self, notification_options, experimental_capabilities)
+
+        flags = getattr(self, "_notification_flags", None)
+        if flags:
+            if caps.resources is not None:
+                caps.resources.subscribe = True
+                if flags.resources_changed:
+                    caps.resources.listChanged = True
+            if caps.prompts is not None and flags.prompts_changed:
+                caps.prompts.listChanged = True
+            if caps.tools is not None and flags.tools_changed:
+                caps.tools.listChanged = True
+
+        return caps
+
+    @property
+    def authorization_manager(self) -> AuthorizationManager | None:
+        return self._authorization_manager
+
+    @property
+    def connection_resolver(self) -> ConnectionResolver | None:
+        """Return the configured connection resolver, if any."""
+        return self._connection_resolver
+
+    def set_connection_resolver(self, resolver: ConnectionResolver | None) -> None:
+        """Configure the resolver used by Context.resolve_client calls."""
+        self._connection_resolver = resolver
+
+    def set_authorization_provider(self, provider: AuthorizationProvider) -> None:
+        if self._authorization_manager is None:
+            raise RuntimeError("Authorization is not enabled for this server")
+        self._authorization_manager.set_provider(provider)
+
+    # //////////////////////////////////////////////////////////////////
+    # Binding context
+    # //////////////////////////////////////////////////////////////////
+
+    @contextmanager
+    def binding(self) -> Iterator[MCPServer]:
+        self._binding_depth += 1
+        tool_token = set_tool_server(self)
+        resource_token = set_resource_server(self)
+        completion_token = set_completion_server(self)
+        prompt_token = set_prompt_server(self)
+        template_token = set_resource_template_server(self)
+        try:
+            yield self
+        finally:
+            reset_tool_server(tool_token)
+            reset_resource_server(resource_token)
+            reset_completion_server(completion_token)
+            reset_prompt_server(prompt_token)
+            reset_resource_template_server(template_token)
+            self._binding_depth -= 1
+            if (
+                self._binding_depth == 0
+                and self._runtime_started
+                and self._allow_dynamic_tools
+                and self._tool_mutation_pending_notification
+            ):
+                self._logger.warning(
+                    "Tools were mutated in dynamic mode without emitting notifications/tools/list_changed. "
+                    "Call notify_tools_list_changed() so clients can refresh their state."
+                )
+
+    def _wrap_lifespan(self, base_lifespan: Callable[[Server[Any, Any]], Any]) -> Callable[[Server[Any, Any]], Any]:
+        @asynccontextmanager
+        async def runtime_lifespan(server_ref: Server[Any, Any]) -> Any:
+            async with AsyncExitStack() as stack:
+                base_context = await stack.enter_async_context(base_lifespan(server_ref))
+                payload = self._compose_lifespan_payload(base_context)
+                try:
+                    yield payload
+                finally:
+                    if isinstance(payload, dict):
+                        payload.pop(RUNTIME_CONTEXT_KEY, None)
+
+        return runtime_lifespan
+
+    def _compose_lifespan_payload(self, base_context: Any) -> dict[str, Any]:
+        if base_context is None:
+            payload: dict[str, Any] = {}
+        elif isinstance(base_context, dict):
+            payload = base_context
+        elif isinstance(base_context, Mapping):
+            payload = dict(base_context)
+        else:
+            payload = {"_dedalus_mcp.base_context": base_context}
+
+        payload[RUNTIME_CONTEXT_KEY] = self._build_runtime_payload()
+        return payload
+
+    def _build_runtime_payload(self) -> dict[str, Any]:
+        """Build runtime context payload with dispatch backend and connection handles.
+
+        Initializes dispatch backend lazily on first call (during lifespan startup).
+        """
+        # Initialize dispatch backend and connection handles if needed
+        if self._dispatch_backend is None and self._connections:
+            self._initialize_dispatch_backend()
+
+        return {"server": self, "resolver": self._connection_resolver, "dispatch_backend": self._dispatch_backend}
+
+    def _initialize_dispatch_backend(self) -> None:
+        """Initialize dispatch backend from environment.
+
+        Requires DEDALUS_DISPATCH_URL to be set. Dispatch is only available
+        through Dedalus-hosted MCP servers.
+        """
+        from ..dispatch import create_dispatch_backend_from_env
+
+        self._dispatch_backend = create_dispatch_backend_from_env()
+
+    # TODO: Quality check on this impl.
+    async def _handle_request(
+        self,
+        message: RequestResponder[ClientRequest, ServerResult],
+        req: Any,
+        session: ServerSession,
+        lifespan_context: Any,
+        raise_exceptions: bool,
+    ) -> None:
+        """Instrument requests to record wall-clock duration and structured metadata."""
+        start_ns = time.perf_counter_ns()
+        request_type = type(req).__name__
+        request_id = getattr(message, "request_id", None)
+        outcome = "ok"
+
+        handler = self.request_handlers.get(type(req))
+        dispatch_extra: dict[str, Any] = {"event": "mcp.request.dispatch", "request_type": request_type}
+        if request_id is not None:
+            dispatch_extra["request_id"] = request_id
+
+        try:
+            if handler is None:
+                outcome = "method_not_found"
+                await message.respond(ErrorData(code=METHOD_NOT_FOUND, message="Method not found"))
+                return
+
+            self._logger.debug("dispatching request", extra=dispatch_extra)
+
+            token = None
+            response: ServerResult | ErrorData | None = None
+            try:
+                request_data = None
+                metadata = message.message_metadata
+                if metadata is not None and isinstance(metadata, ServerMessageMetadata):
+                    request_data = metadata.request_context
+
+                token = request_ctx.set(
+                    RequestContext(
+                        request_id=message.request_id,
+                        meta=message.request_meta,
+                        session=session,
+                        lifespan_context=lifespan_context,
+                        request=request_data,
+                    )
+                )
+                response = await handler(req)
+            except McpError as err:
+                outcome = "error"
+                response = err.error
+            except anyio.get_cancelled_exc_class():
+                self._logger.info("Request %s cancelled - duplicate response suppressed", message.request_id)
+                outcome = "cancelled"
+                return
+            except Exception as exc:
+                outcome = "exception"
+                if raise_exceptions:
+                    raise
+                response = ErrorData(code=0, message=str(exc), data=None)
+            finally:
+                if token is not None:
+                    request_ctx.reset(token)
+
+            if response is not None:
+                await message.respond(response)
+        finally:
+            duration_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
+            timing_extra: dict[str, Any] = {
+                "event": "mcp.request.completed",
+                "request_type": request_type,
+                "request_outcome": outcome,
+                "duration_ms": duration_ms,
+            }
+            if request_id is not None:
+                timing_extra["request_id"] = request_id
+            self._logger.info("request completed", extra=timing_extra)
+
+    # //////////////////////////////////////////////////////////////////
+    # Transport registry
+    # //////////////////////////////////////////////////////////////////
+
+    @staticmethod
+    def _default_http_security_settings(
+        *,
+        enable_dns_rebinding_protection: bool | None = None,
+        allowed_hosts: list[str] | None = None,
+        allowed_origins: list[str] | None = None,
+    ) -> TransportSecuritySettings:
+        """Return security settings for streamable HTTP transport.
+
+        Parameters take precedence over environment variables, which take
+        precedence over permissive defaults.
+
+        Args:
+            enable_dns_rebinding_protection: Validate Host headers. Env: MCP_DNS_REBINDING_PROTECTION
+            allowed_hosts: Host:port patterns (e.g., ["localhost:*"]). Env: MCP_ALLOWED_HOSTS
+            allowed_origins: Allowed origins for CORS. Env: MCP_ALLOWED_ORIGINS
+        """
+        import os
+
+        # Resolve enable_dns_rebinding_protection: param > env > False
+        if enable_dns_rebinding_protection is None:
+            enable_dns_rebinding_protection = os.environ.get("MCP_DNS_REBINDING_PROTECTION", "").lower() == "true"
+
+        # Resolve allowed_hosts: param > env > []
+        if allowed_hosts is None:
+            env_val = os.environ.get("MCP_ALLOWED_HOSTS", "")
+            allowed_hosts = [h.strip() for h in env_val.split(",") if h.strip()] if env_val else []
+
+        # Resolve allowed_origins: param > env > []
+        if allowed_origins is None:
+            env_val = os.environ.get("MCP_ALLOWED_ORIGINS", "")
+            allowed_origins = [o.strip() for o in env_val.split(",") if o.strip()] if env_val else []
+
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=enable_dns_rebinding_protection,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        )
+
+    def register_transport(self, name: str, factory: TransportFactory, *, aliases: Iterable[str] | None = None) -> None:
+        canonical = name.lower()
+        self._transport_factories[canonical] = factory
+        for alias in aliases or ():
+            self._transport_factories[alias.lower()] = factory
+
+    def _transport_for_name(self, name: str) -> BaseTransport:
+        factory = self._transport_factories.get(name)
+        if factory is None:
+            raise ValueError(f"Unsupported transport '{name}'.")
+        transport = factory(self)
+        if not isinstance(transport, BaseTransport):
+            raise TypeError("Transport factory must return a BaseTransport instance")
+        return transport
+
+    def configure_streamable_http_security(self, settings: TransportSecuritySettings | None) -> None:
+        """Update the security guard used by the Streamable HTTP transport."""
+        self._http_security_settings = settings if settings is not None else self._default_http_security_settings()
+
+    # //////////////////////////////////////////////////////////////////
+    # Transport helpers
+    # //////////////////////////////////////////////////////////////////
+
+    async def serve_stdio(
+        self, *, raise_exceptions: bool = False, stateless: bool = False, validate: bool = True, announce: bool = True
+    ) -> None:
+        self._runtime_started = True
+        if validate:
+            self.validate()
+        transport = self._transport_for_name("stdio")
+        if announce:
+            mode = "stateless" if stateless else "stateful"
+            self._logger.info("Serving %s via STDIO (%s)", self.name, mode)
+        await self._run_transport(transport, raise_exceptions=raise_exceptions, stateless=stateless)
+
+    async def serve(
+        self,
+        *,
+        transport: str | None = None,
+        validate: bool = True,
+        verbose: bool = True,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+        path: str = "/mcp",
+        log_level: str = "info",
+        stateless: bool = False,
+        raise_exceptions: bool = False,
+        uvicorn_options: Mapping[str, Any] | None = None,
+        **transport_kwargs: Any,
+    ) -> None:
+        import os
+
+        # Resolve port: param > PORT env > 8000 (local-friendly default)
+        if port is None:
+            port = int(os.environ.get("PORT", 8000))
+
+        selected = (transport or self._default_transport).lower()
+        self._runtime_started = True
+
+        if validate:
+            self.validate()
+
+        if selected in {"stdio", "streamable-http", "streamable_http", "http", "shttp"}:
+            if selected == "stdio":
+                if transport_kwargs:
+                    unexpected = ", ".join(sorted(transport_kwargs))
+                    msg = f"Unsupported STDIO serve() parameters: {unexpected}"
+                    raise TypeError(msg)
+                await self.serve_stdio(
+                    raise_exceptions=raise_exceptions, stateless=stateless, validate=False, announce=verbose
+                )
+                return
+
+            if transport_kwargs:
+                unexpected = ", ".join(sorted(transport_kwargs))
+                raise TypeError(f"Unsupported Streamable HTTP serve() parameters: {unexpected}")
+
+            extra_http = dict(uvicorn_options or {})
+            await self.serve_streamable_http(
+                host=host, port=port, path=path, log_level=log_level, validate=False, announce=verbose, **extra_http
+            )
+            return
+
+        transport_instance = self._transport_for_name(selected)
+
+        if verbose:
+            self._logger.info("Serving %s via %s transport", self.name, transport_instance.transport_display_name)
+
+        await self._run_transport(transport_instance, **transport_kwargs)
+
+    async def serve_streamable_http(
+        self,
+        host: str = "0.0.0.0",
+        port: int | None = None,
+        path: str = "/mcp",
+        log_level: str = "info",
+        *,
+        validate: bool = True,
+        announce: bool = True,
+        **uvicorn_options: Any,
+    ) -> None:
+        import os
+
+        # Resolve port: param > PORT env > 8080 (Lambda adapter default)
+        if port is None:
+            port = int(os.environ.get("PORT", 8080))
+
+        if validate:
+            self.validate()
+        transport = self._transport_for_name("streamable-http")
+        run_config = ASGIRunConfig(
+            host=host, port=port, path=path, log_level=log_level, uvicorn_options=dict(uvicorn_options)
+        )
+        base_url = f"http://{host}:{port}{path}"
+        self._serving_url = base_url
+        if announce:
+            if self._streamable_http_stateless:
+                self._logger.info("Serving %s via Streamable HTTP (stateless) at %s", self.name, base_url)
+            else:
+                self._logger.info("Serving %s via Streamable HTTP at %s", self.name, base_url)
+        try:
+            await self._run_transport(transport, config=run_config)
+        finally:
+            self._serving_url = None
+
+    async def _run_transport(self, transport: BaseTransport, **kwargs: Any) -> None:
+        self._active_transport = transport
+        try:
+            await transport.run(**kwargs)
+        finally:
+            self._active_transport = None
+
+    async def shutdown(self) -> None:
+        transport = self._active_transport
+        if transport is None:
+            return
+        await transport.stop()
+
+    # //////////////////////////////////////////////////////////////////
+    # Validation
+    # //////////////////////////////////////////////////////////////////
+
+    def validate(self) -> None:
+        """Validate the server configuration against MCP requirements.
+
+        Validation ensures that each advertised capability is backed by a service
+        implementing the behaviour mandated by the specification.  This keeps the
+        framework "plug-and-play" without allowing integrators to accidentally
+        ship a server that violates the MCP contract.
+        """
+        errors: list[str] = []
+
+        tools_service: Any = self.tools
+        if not isinstance(tools_service, ToolsServiceProtocol):
+            errors.append(
+                f"Tools capability requires a service implementing list/listChanged operations ({_SPEC_URLS['tools']})."
+            )
+
+        resources_service: Any = self.resources
+        if not isinstance(resources_service, ResourcesServiceProtocol):
+            errors.append(f"Resources capability requires list/read/notify support ({_SPEC_URLS['resources']}).")
+
+        prompts_service: Any = self.prompts
+        if not isinstance(prompts_service, PromptsServiceProtocol):
+            errors.append(f"Prompts capability requires list/get/notify support ({_SPEC_URLS['prompts']}).")
+
+        roots_service: Any = self.roots
+        if not isinstance(roots_service, RootsServiceProtocol):
+            errors.append(f"Roots capability requires guard and session lifecycle handlers ({_SPEC_URLS['roots']}).")
+
+        completions_service: Any = self.completions
+        if not isinstance(completions_service, CompletionServiceProtocol):
+            errors.append(f"Completions capability requires register/execute support ({_SPEC_URLS['completions']}).")
+
+        sampling_service: Any = self.sampling
+        if not isinstance(sampling_service, SamplingServiceProtocol):
+            errors.append(f"Sampling capability requires create_message handling ({_SPEC_URLS['sampling']}).")
+
+        elicitation_service: Any = self.elicitation
+        if not isinstance(elicitation_service, ElicitationServiceProtocol):
+            errors.append(f"Elicitation capability requires create handling ({_SPEC_URLS['elicitation']}).")
+
+        logging_service: Any = self.logging_service
+        if not isinstance(logging_service, LoggingServiceProtocol):
+            errors.append(f"Logging capability requires set_level and emit support ({_SPEC_URLS['logging']}).")
+
+        ping_service: Any = self.ping
+        if not isinstance(ping_service, PingServiceProtocol):
+            errors.append(f"Ping capability requires ping/ping_many/heartbeat support ({_SPEC_URLS['ping']}).")
+
+        if errors:
+            bullet_list = "\n - ".join(errors)
+            msg = f"MCPServer configuration is invalid:\n - {bullet_list}"
+            raise ServerValidationError(msg)
+
+    # //////////////////////////////////////////////////////////////////
+    # Internal helpers
+    # //////////////////////////////////////////////////////////////////
+
+    def _attach_tool(self, name: str, fn: Callable[..., Any]) -> None:
+        setattr(self, name, fn)
+
+    def _detach_tool(self, name: str) -> None:
+        if hasattr(self, name):
+            try:
+                delattr(self, name)
+            except AttributeError:
+                pass

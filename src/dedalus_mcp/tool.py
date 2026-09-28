@@ -1,0 +1,199 @@
+# Copyright (c) 2026 Dedalus Labs, Inc. and its contributors
+# SPDX-License-Identifier: MIT
+
+"""Tool registration utilities with schema inference from type hints."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from . import types
+from .server.dependencies import Depends
+from .utils.schema import resolve_input_schema, resolve_output_schema
+
+
+if types:  # keep pydoc happy when mcp.types is unavailable during static checks
+    types.Tool  # noqa: B018
+    types.ToolAnnotations  # noqa: B018
+    types.Icon  # noqa: B018
+
+
+if TYPE_CHECKING:
+    from .server import MCPServer
+
+
+ToolAnnotationsLike = Mapping[str, Any] | types.ToolAnnotations
+IconLike = Mapping[str, Any] | types.Icon
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+ToolFn = Callable[..., Any]
+
+
+@dataclass(slots=True)
+class ToolSpec:
+    """In-memory representation of a tool definition."""
+
+    name: str
+    fn: ToolFn
+    description: str = ""
+    tags: set[str] = field(default_factory=set)
+    input_schema: dict[str, Any] | None = None
+    enabled: Callable[[MCPServer], bool] | Depends | None = None
+    title: str | None = None
+    output_schema: dict[str, Any] | None = None
+    annotations: types.ToolAnnotations | None = None
+    icons: list[types.Icon] | None = None
+    required_scopes: set[str] = field(default_factory=set)
+    """OAuth scopes required to invoke this tool. Empty = no scope restriction."""
+
+
+_TOOL_ATTR = "__dedalus_mcp_tool__"
+_ACTIVE_SERVER: ContextVar[MCPServer | None] = ContextVar("_dedalus_mcp_active_server", default=None)
+
+
+def get_active_server() -> MCPServer | None:
+    """Return the server currently binding tool definitions, if any."""
+    return _ACTIVE_SERVER.get()
+
+
+def set_active_server(server: MCPServer) -> Any:
+    """Activate a server for ambient registration (internal helper)."""
+    return _ACTIVE_SERVER.set(server)
+
+
+def reset_active_server(token: Any) -> None:
+    """Reset the active server context (internal helper)."""
+    _ACTIVE_SERVER.reset(token)
+
+
+def _coerce_tags(tags: Iterable[str] | None) -> set[str]:
+    if not tags:
+        return set()
+    result = {str(tag).strip() for tag in tags if str(tag).strip()}
+    return result
+
+
+def _coerce_annotations(value: ToolAnnotationsLike | None) -> types.ToolAnnotations | None:
+    if value is None:
+        return None
+    if isinstance(value, types.ToolAnnotations):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("annotations must be ToolAnnotations or mapping")
+    return types.ToolAnnotations(**value)
+
+
+def _coerce_icon(value: IconLike) -> types.Icon:
+    if isinstance(value, types.Icon):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("icon must be Icon or mapping")
+    return types.Icon(**value)
+
+
+def tool(
+    name: str | None = None,
+    *,
+    description: str | None = None,
+    tags: Iterable[str] | None = None,
+    input_schema: dict[str, Any] | None = None,
+    enabled: Callable[[MCPServer], bool] | Depends | None = None,
+    title: str | None = None,
+    output_schema: dict[str, Any] | None = None,
+    annotations: ToolAnnotationsLike | None = None,
+    icons: Iterable[IconLike] | None = None,
+    required_scopes: Iterable[str] | None = None,
+) -> Callable[[ToolFn], ToolFn]:
+    """Decorator that marks a callable as an MCP tool.
+
+    Basic usage:
+
+        >>> from dedalus_mcp import MCPServer, tool
+        >>>
+        >>> @tool(description="Add two numbers")
+        ... def add(a: int, b: int) -> int:
+        ...     return a + b
+        >>>
+        >>> server = MCPServer("calculator")
+        >>> server.collect(add)
+
+    With tags and custom name:
+
+        >>> @tool(name="math/multiply", tags=["math", "arithmetic"])
+        ... def multiply(x: float, y: float) -> float:
+        ...     '''Multiply two numbers.'''
+        ...     return x * y
+
+    With OAuth scope requirements:
+
+        >>> @tool(
+        ...     description="Delete a repository", required_scopes=["repo:delete"]
+        ... )
+        ... def delete_repo(name: str) -> None:
+        ...     '''Delete repository by name.'''
+        ...     ...
+
+    The decorator attaches a :class:`ToolSpec` to the function and, if a server
+    is actively binding, registers it immediately.
+    """
+
+    def decorator(fn: ToolFn) -> ToolFn:
+        desc = (description if description is not None else (fn.__doc__ or "")).strip()
+
+        resolved_input_schema = None
+        if input_schema is not None:
+            resolved_input_schema = resolve_input_schema(input_schema)
+
+        resolved_output_schema = None
+        if output_schema is not None:
+            resolved_output_schema = resolve_output_schema(output_schema).schema
+
+        spec = ToolSpec(
+            name=name or fn.__name__ or "anonymous",
+            fn=fn,
+            description=desc,
+            tags=_coerce_tags(tags),
+            input_schema=resolved_input_schema,
+            enabled=enabled,
+            title=title,
+            output_schema=resolved_output_schema,
+            annotations=_coerce_annotations(annotations),
+            icons=[_coerce_icon(i) for i in icons] if icons is not None else None,
+            required_scopes=_coerce_tags(required_scopes),
+        )
+        setattr(fn, _TOOL_ATTR, spec)
+
+        server = get_active_server()
+        if server is not None:
+            server.register_tool(spec)
+
+        return fn
+
+    return decorator
+
+
+def extract_tool_spec(fn: ToolFn) -> ToolSpec | None:
+    """Return the attached :class:`ToolSpec` for *fn*, if present."""
+    spec = getattr(fn, _TOOL_ATTR, None)
+    if spec is None:
+        return None
+    if not isinstance(spec, ToolSpec):
+        return None
+    return spec
+
+
+__all__ = [
+    "ToolSpec",
+    "ToolFn",
+    "tool",
+    "extract_tool_spec",
+    "get_active_server",
+    "set_active_server",
+    "reset_active_server",
+]
